@@ -1,6 +1,6 @@
 services:
   prompt-optimizer:
-    image: linshen/prompt-optimizer:latest
+    image: craftslab/prompt-optimizer:latest
     # Alternatively, you can build from source:
     # build:
     #   context: .
