@@ -1,25 +1,32 @@
-import { ModelConfig, IModelManager } from './types';
-import { ModelConfigError } from '../llm/errors';
+import { IModelManager, ModelConfig } from './types';
+import { IStorageProvider } from '../storage/types';
+import { StorageFactory } from '../storage/factory';
+import { StorageAdapter } from '../storage/adapter';
 import { defaultModels } from './defaults';
+import { ModelConfigError } from '../llm/errors';
 
 /**
  * 模型管理器实现
  */
 export class ModelManager implements IModelManager {
   private models: Record<string, ModelConfig>;
+  private readonly storageKey = 'models';
+  private readonly storage: IStorageProvider;
 
-  constructor() {
-    this.models = {};
-    this.init();
+  constructor(storageProvider: IStorageProvider) {
+    this.models = { ...defaultModels };
+    // 使用适配器确保所有存储提供者都支持高级方法
+    this.storage = new StorageAdapter(storageProvider);
+    this.init().catch(err => console.error('初始化模型管理器失败:', err));
   }
 
   /**
    * 初始化模型管理器
    */
-  private init(): void {
+  private async init(): Promise<void> {
     try {
       // 1. 先从本地存储加载所有模型配置
-      const storedData = localStorage.getItem('models');
+      const storedData = await this.storage.getItem(this.storageKey);
       if (storedData) {
         console.log('加载模型配置:', storedData);
         this.models = JSON.parse(storedData);
@@ -38,7 +45,7 @@ export class ModelManager implements IModelManager {
 
       // 3. 如果有新增的内置模型，保存到本地存储
       if (hasChanges) {
-        this.saveToStorage();
+        await this.saveToStorage();
       }
     } catch (error) {
       console.error('初始化模型管理器失败:', error);
@@ -48,9 +55,9 @@ export class ModelManager implements IModelManager {
   /**
    * 获取所有模型配置
    */
-  getAllModels(): Array<ModelConfig & { key: string }> {
+  async getAllModels(): Promise<Array<ModelConfig & { key: string }>> {
     // 每次获取都从存储重新加载最新数据
-    const storedData = localStorage.getItem('models');
+    const storedData = await this.storage.getItem(this.storageKey);
     if (storedData) {
       try {
         this.models = JSON.parse(storedData);
@@ -64,96 +71,178 @@ export class ModelManager implements IModelManager {
       key
     }));
     return returnValue;
-
   }
 
   /**
    * 获取指定模型配置
    */
-  getModel(key: string): ModelConfig | undefined {
+  async getModel(key: string): Promise<ModelConfig | undefined> {
+    const storedData = await this.storage.getItem(this.storageKey);
+    if (storedData) {
+      try {
+        this.models = JSON.parse(storedData);
+      } catch (error) {
+        console.error('解析模型配置失败:', error);
+        return undefined;
+      }
+    }
     return this.models[key];
   }
 
   /**
    * 添加模型配置
    */
-  addModel(key: string, config: ModelConfig): void {
-    if (this.models[key]) {
-      throw new ModelConfigError(`模型 ${key} 已存在`);
-    }
+  async addModel(key: string, config: ModelConfig): Promise<void> {
     this.validateConfig(config);
+    
+    await this.storage.updateData<Record<string, ModelConfig>>(
+      this.storageKey,
+      (currentModels) => {
+        const models = currentModels || {};
+        if (models[key]) {
+          throw new ModelConfigError(`模型 ${key} 已存在`);
+        }
+        return {
+          ...models,
+          [key]: { ...config }
+        };
+      }
+    );
+    
+    // 更新内存状态
     this.models[key] = { ...config };
-    this.saveToStorage();
   }
 
   /**
    * 更新模型配置
    */
-  updateModel(key: string, config: Partial<ModelConfig>): void {
-    if (!this.models[key]) {
-      throw new ModelConfigError(`模型 ${key} 不存在`);
+  async updateModel(key: string, config: Partial<ModelConfig>): Promise<void> {
+    let updatedConfig: ModelConfig | undefined;
+    
+    await this.storage.updateData<Record<string, ModelConfig>>(
+      this.storageKey,
+      (currentModels) => {
+        const models = currentModels || {};
+        
+        // 如果模型不存在，检查是否是内置模型
+        if (!models[key]) {
+          if (!defaultModels[key]) {
+            throw new ModelConfigError(`模型 ${key} 不存在`);
+          }
+          // 如果是内置模型但尚未配置，创建初始配置
+          models[key] = { ...defaultModels[key] };
+        }
+        
+        // 合并配置时保留原有 enabled 状态
+        updatedConfig = {
+          ...models[key],
+          ...config,
+          // 确保 enabled 属性存在
+          enabled: config.enabled !== undefined ? config.enabled : models[key].enabled
+        };
+
+        // 如果更新了关键字段或尝试启用模型，需要验证配置
+        if (
+          config.name !== undefined ||
+          config.baseURL !== undefined ||
+          config.models !== undefined ||
+          config.defaultModel !== undefined ||
+          config.apiKey !== undefined ||
+          config.enabled
+        ) {
+          this.validateConfig(updatedConfig);
+        }
+
+        return {
+          ...models,
+          [key]: updatedConfig
+        };
+      }
+    );
+    
+    // 只更新特定模型的内存状态，不重新加载全部数据
+    if (updatedConfig) {
+      this.models[key] = updatedConfig;
     }
-
-    // 合并配置时保留原有 enabled 状态
-    const updatedConfig = {
-      ...this.models[key],
-      ...config,
-      // 确保 enabled 属性存在
-      enabled: config.enabled !== undefined ? config.enabled : this.models[key].enabled
-    };
-
-    // 如果更新了关键字段或尝试启用模型，需要验证配置
-    if (
-      config.name !== undefined ||
-      config.baseURL !== undefined ||
-      config.models !== undefined ||
-      config.defaultModel !== undefined ||
-      config.apiKey !== undefined ||
-      config.enabled
-    ) {
-      this.validateConfig(updatedConfig);
-    }
-
-    this.models[key] = updatedConfig;
-    this.saveToStorage();
   }
 
   /**
    * 删除模型配置
    */
-  deleteModel(key: string): void {
-    if (!this.models[key]) {
-      throw new ModelConfigError(`模型 ${key} 不存在`);
-    }
+  async deleteModel(key: string): Promise<void> {
+    await this.storage.updateData<Record<string, ModelConfig>>(
+      this.storageKey,
+      (currentModels) => {
+        const models = currentModels || {};
+        if (!models[key]) {
+          throw new ModelConfigError(`模型 ${key} 不存在`);
+        }
+        const { [key]: removed, ...remaining } = models;
+        return remaining;
+      }
+    );
+    
+    // 更新内存状态
     delete this.models[key];
-    this.saveToStorage();
   }
 
   /**
    * 启用模型
    */
-  enableModel(key: string): void {
-    if (!this.models[key]) {
-      throw new ModelConfigError(`未知的模型: ${key}`);
+  async enableModel(key: string): Promise<void> {
+    await this.storage.updateData<Record<string, ModelConfig>>(
+      this.storageKey,
+      (currentModels) => {
+        const models = currentModels || {};
+        if (!models[key]) {
+          throw new ModelConfigError(`未知的模型: ${key}`);
+        }
+
+        // 使用完整验证
+        this.validateEnableConfig(models[key]);
+
+        return {
+          ...models,
+          [key]: {
+            ...models[key],
+            enabled: true
+          }
+        };
+      }
+    );
+    
+    // 更新内存状态 - 确保模型存在
+    if (this.models[key]) {
+      this.models[key].enabled = true;
     }
-
-    // 使用完整验证
-    this.validateEnableConfig(this.models[key]);
-
-    this.models[key].enabled = true;
-    this.saveToStorage();
   }
 
   /**
    * 禁用模型
    */
-  disableModel(key: string): void {
-    if (!this.models[key]) {
-      throw new ModelConfigError(`未知的模型: ${key}`);
-    }
+  async disableModel(key: string): Promise<void> {
+    await this.storage.updateData<Record<string, ModelConfig>>(
+      this.storageKey,
+      (currentModels) => {
+        const models = currentModels || {};
+        if (!models[key]) {
+          throw new ModelConfigError(`未知的模型: ${key}`);
+        }
 
-    this.models[key].enabled = false;
-    this.saveToStorage();
+        return {
+          ...models,
+          [key]: {
+            ...models[key],
+            enabled: false
+          }
+        };
+      }
+    );
+    
+    // 更新内存状态 - 确保模型存在
+    if (this.models[key]) {
+      this.models[key].enabled = false;
+    }
   }
 
   /**
@@ -195,9 +284,9 @@ export class ModelManager implements IModelManager {
   /**
    * 保存配置到本地存储
    */
-  private saveToStorage(): void {
+  private async saveToStorage(): Promise<void> {
     try {
-      localStorage.setItem('models', JSON.stringify(this.models));
+      await this.storage.setItem(this.storageKey, JSON.stringify(this.models));
     } catch (error) {
       console.error('保存模型配置失败:', error);
     }
@@ -206,10 +295,11 @@ export class ModelManager implements IModelManager {
   /**
    * 获取所有已启用的模型配置
    */
-  getEnabledModels(): Array<ModelConfig & { key: string }> {
-    return this.getAllModels().filter(model => model.enabled);
+  async getEnabledModels(): Promise<Array<ModelConfig & { key: string }>> {
+    const allModels = await this.getAllModels();
+    return allModels.filter(model => model.enabled);
   }
 }
 
 // 导出单例实例
-export const modelManager = new ModelManager();
+export const modelManager = new ModelManager(StorageFactory.createDefault());
